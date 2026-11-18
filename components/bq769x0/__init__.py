@@ -26,6 +26,29 @@ CONF_MAXIMUM_CELL_VOLTAGE = "maximum_cell_voltage"
 CONF_MAXIMUM_CHARGE_CURRENT = "maximum_charge_current"
 CONF_MAXIMUM_DISCHARGE_CURRENT = "maximum_discharge_current"
 CONF_OVERCURRENT_RECOVERY_TIME = "overcurrent_recovery_time"
+CONF_SHORT_CIRCUIT_CURRENT = "short_circuit_current"
+CONF_SHORT_CIRCUIT_DELAY = "short_circuit_delay"
+CONF_DISCHARGE_OVERCURRENT_DELAY = "discharge_overcurrent_delay"
+CONF_OVERVOLTAGE_DELAY = "overvoltage_delay"
+CONF_UNDERVOLTAGE_DELAY = "undervoltage_delay"
+
+# Supported hardware protection delays, in register code order.
+SHORT_CIRCUIT_DELAYS = ["70us", "100us", "200us", "400us"]
+DISCHARGE_OVERCURRENT_DELAYS = [
+    "8ms",
+    "20ms",
+    "40ms",
+    "80ms",
+    "160ms",
+    "320ms",
+    "640ms",
+    "1280ms",
+]
+OVERVOLTAGE_DELAYS = ["1s", "2s", "4s", "8s"]
+UNDERVOLTAGE_DELAYS = ["1s", "4s", "8s", "16s"]
+# Largest hardware thresholds across the sense resistor (upper range).
+MAX_DISCHARGE_OVERCURRENT_MV = 100
+MAX_SHORT_CIRCUIT_MV = 200
 
 MAX_CELLS = 15
 
@@ -70,12 +93,52 @@ def _validate_cell_voltage_limits(config):
 
 
 def _validate_current_limits(config):
-    for key in (CONF_MAXIMUM_CHARGE_CURRENT, CONF_MAXIMUM_DISCHARGE_CURRENT):
+    for key in (
+        CONF_MAXIMUM_CHARGE_CURRENT,
+        CONF_MAXIMUM_DISCHARGE_CURRENT,
+        CONF_SHORT_CIRCUIT_CURRENT,
+    ):
         if key in config and CONF_SHUNT_RESISTANCE not in config:
             raise cv.Invalid(
                 f"{CONF_SHUNT_RESISTANCE} is required to limit current", path=[key]
             )
+    shunt = config.get(CONF_SHUNT_RESISTANCE)
+    for key, max_mv in (
+        (CONF_MAXIMUM_DISCHARGE_CURRENT, MAX_DISCHARGE_OVERCURRENT_MV),
+        (CONF_SHORT_CIRCUIT_CURRENT, MAX_SHORT_CIRCUIT_MV),
+    ):
+        if key in config and config[key] * shunt * 1000 > max_mv:
+            raise cv.Invalid(
+                f"Above the hardware limit of {max_mv / (shunt * 1000):.2f} A "
+                f"({max_mv} mV across {CONF_SHUNT_RESISTANCE})",
+                path=[key],
+            )
+    if (
+        CONF_SHORT_CIRCUIT_CURRENT in config
+        and CONF_MAXIMUM_DISCHARGE_CURRENT in config
+        and config[CONF_SHORT_CIRCUIT_CURRENT] <= config[CONF_MAXIMUM_DISCHARGE_CURRENT]
+    ):
+        raise cv.Invalid(
+            f"{CONF_SHORT_CIRCUIT_CURRENT} must be above {CONF_MAXIMUM_DISCHARGE_CURRENT}",
+            path=[CONF_SHORT_CIRCUIT_CURRENT],
+        )
     return config
+
+
+def _delay_code(options):
+    """Validate a time that the hardware supports, returning its register code."""
+    allowed = [
+        cv.positive_time_period_microseconds(option).total_microseconds
+        for option in options
+    ]
+
+    def validator(value):
+        us = cv.positive_time_period_microseconds(value).total_microseconds
+        if us not in allowed:
+            raise cv.Invalid(f"Must be one of {', '.join(options)}")
+        return allowed.index(us)
+
+    return validator
 
 
 _POSITIVE_VOLTAGE = cv.All(cv.voltage, cv.Range(min=0.0, min_included=False))
@@ -117,10 +180,25 @@ CONFIG_SCHEMA = cv.All(
             # Charge/discharge FET is turned off while the current exceeds this.
             cv.Optional(CONF_MAXIMUM_CHARGE_CURRENT): _POSITIVE_CURRENT,
             cv.Optional(CONF_MAXIMUM_DISCHARGE_CURRENT): _POSITIVE_CURRENT,
-            # How long a FET stays off after the last overcurrent reading.
+            # How long a FET stays off after an overcurrent trip before it is retried.
             cv.Optional(
-                CONF_OVERCURRENT_RECOVERY_TIME, default="30s"
+                CONF_OVERCURRENT_RECOVERY_TIME, default="3s"
             ): cv.positive_time_period_milliseconds,
+            # Hardware short-circuit protection: both FETs off until the load is removed.
+            cv.Optional(CONF_SHORT_CIRCUIT_CURRENT): _POSITIVE_CURRENT,
+            # Hardware protection delays; the defaults match the device's power-on defaults.
+            cv.Optional(CONF_SHORT_CIRCUIT_DELAY, default="70us"): _delay_code(
+                SHORT_CIRCUIT_DELAYS
+            ),
+            cv.Optional(CONF_DISCHARGE_OVERCURRENT_DELAY, default="8ms"): _delay_code(
+                DISCHARGE_OVERCURRENT_DELAYS
+            ),
+            cv.Optional(CONF_OVERVOLTAGE_DELAY, default="1s"): _delay_code(
+                OVERVOLTAGE_DELAYS
+            ),
+            cv.Optional(CONF_UNDERVOLTAGE_DELAY, default="1s"): _delay_code(
+                UNDERVOLTAGE_DELAYS
+            ),
         }
     )
     .extend(cv.polling_component_schema("5s"))
@@ -162,6 +240,16 @@ async def to_code(config):
             var.set_maximum_discharge_current(config[CONF_MAXIMUM_DISCHARGE_CURRENT])
         )
     cg.add(var.set_overcurrent_recovery_time(config[CONF_OVERCURRENT_RECOVERY_TIME]))
+    if CONF_SHORT_CIRCUIT_CURRENT in config:
+        cg.add(var.set_short_circuit_current(config[CONF_SHORT_CIRCUIT_CURRENT]))
+    cg.add(var.set_short_circuit_delay_code(config[CONF_SHORT_CIRCUIT_DELAY]))
+    cg.add(
+        var.set_discharge_overcurrent_delay_code(
+            config[CONF_DISCHARGE_OVERCURRENT_DELAY]
+        )
+    )
+    cg.add(var.set_overvoltage_delay_code(config[CONF_OVERVOLTAGE_DELAY]))
+    cg.add(var.set_undervoltage_delay_code(config[CONF_UNDERVOLTAGE_DELAY]))
 
 
 def cell_key(prefix, cell):

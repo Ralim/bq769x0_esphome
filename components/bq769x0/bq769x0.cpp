@@ -64,6 +64,24 @@ void BQ769X0Component::setup() {
   this->adc_gain_uv_ = decode_adc_gain_uv(adcgain1, adcgain2);
   this->adc_offset_mv_ = decode_adc_offset_mv(adcoffset);
 
+  // The device resets these on every power-on, so they are always rewritten. Configured before the ADC is enabled so
+  // OV/UV protection never runs on the defaults.
+  if (!this->configure_protection_()) {
+    ESP_LOGE(TAG, "Failed to configure hardware protection");
+    this->mark_failed();
+    return;
+  }
+  // Faults latched before boot were judged against the previous protection settings.
+  uint8_t status;
+  if (!this->read_register_(reg::SYS_STAT, &status) || (status != 0 && !this->write_register_(reg::SYS_STAT, status))) {
+    ESP_LOGE(TAG, "Failed to clear SYS_STAT");
+    this->mark_failed();
+    return;
+  }
+  if (status & static_cast<uint8_t>(~sys_stat::CC_READY)) {
+    ESP_LOGI(TAG, "Cleared status latched before boot: 0x%02X", status);
+  }
+
   uint8_t sys_ctrl1;
   if (!this->read_register_(reg::SYS_CTRL1, &sys_ctrl1) ||
       !this->write_register_(reg::SYS_CTRL1, sys_ctrl1 | sys_ctrl1::ADC_EN)) {
@@ -88,6 +106,63 @@ void BQ769X0Component::setup() {
     this->mark_failed();
     return;
   }
+}
+
+bool BQ769X0Component::configure_protection_() {
+  // OCD/SCD thresholds are voltages across the shunt; without one only the lowest thresholds can be used.
+  const float to_mv = this->shunt_resistance_ * 1000.0f;
+  const float ocd_mv = this->max_discharge_a_ * to_mv;
+  const float scd_mv = this->short_circuit_a_ * to_mv;
+  const bool upper = protection_upper_range(ocd_mv, scd_mv);
+  const uint8_t ocd_code = threshold_code_at_or_above(OCD_THRESHOLDS_MV[upper], 16, ocd_mv);
+  const uint8_t scd_code = threshold_code_at_or_above(SCD_THRESHOLDS_MV[upper], 8, scd_mv);
+
+  // Hardware OV/UV are a backstop just beyond the software limits, so the software always acts first.
+  // Without a configured limit the device default is kept. Anything more than one step away was clamped.
+  const int32_t step_mv = (16 * this->adc_gain_uv_ + 999) / 1000;
+  uint8_t ov_trip = OV_TRIP_DEFAULT;
+  uint8_t uv_trip = UV_TRIP_DEFAULT;
+  if (this->max_cell_mv_ > 0) {
+    ov_trip = ov_trip_code(this->max_cell_mv_, this->adc_gain_uv_, this->adc_offset_mv_);
+    const int32_t actual = ov_trip_mv(ov_trip, this->adc_gain_uv_, this->adc_offset_mv_);
+    if (actual < this->max_cell_mv_ || actual - this->max_cell_mv_ > step_mv) {
+      ESP_LOGW(TAG, "maximum_cell_voltage is outside the hardware OV range, using %" PRId32 " mV", actual);
+    }
+  }
+  if (this->min_cell_mv_ > 0) {
+    uv_trip = uv_trip_code(this->min_cell_mv_, this->adc_gain_uv_, this->adc_offset_mv_);
+    const int32_t actual = uv_trip_mv(uv_trip, this->adc_gain_uv_, this->adc_offset_mv_);
+    if (actual > this->min_cell_mv_ || this->min_cell_mv_ - actual > step_mv) {
+      ESP_LOGW(TAG, "minimum_cell_voltage is outside the hardware UV range, using %" PRId32 " mV", actual);
+    }
+  }
+
+  this->protect_[0] = protect1_value(upper, this->scd_delay_code_, scd_code);
+  this->protect_[1] = protect2_value(this->ocd_delay_code_, ocd_code);
+  this->protect_[2] = protect3_value(this->uv_delay_code_, this->ov_delay_code_);
+  this->protect_[3] = ov_trip;
+  this->protect_[4] = uv_trip;
+
+  // PROTECT1..UV_TRIP are contiguous.
+  for (uint8_t i = 0; i < sizeof(this->protect_); i++) {
+    if (!this->write_register_(reg::PROTECT1 + i, this->protect_[i])) {
+      return false;
+    }
+  }
+  uint8_t readback[sizeof(this->protect_)];
+  if (!this->read_registers_(reg::PROTECT1, readback, sizeof(readback))) {
+    return false;
+  }
+  for (uint8_t i = 0; i < sizeof(this->protect_); i++) {
+    // PROTECT1 bit 6 and PROTECT2 bit 7 are read-only.
+    const uint8_t mask = i == 0 ? 0xBF : (i == 1 ? 0x7F : 0xFF);
+    if ((readback[i] & mask) != this->protect_[i]) {
+      ESP_LOGE(TAG, "Protection register 0x%02X reads 0x%02X, wrote 0x%02X", reg::PROTECT1 + i, readback[i],
+               this->protect_[i]);
+      return false;
+    }
+  }
+  return true;
 }
 
 void BQ769X0Component::loop() {
@@ -275,42 +350,39 @@ uint8_t BQ769X0Component::controlled_fets_() const {
 }
 
 bool BQ769X0Component::check_current_limits_() {
-  const uint32_t now = millis();
   const uint8_t blocked =
       this->current_valid_ ? fets_blocked_by_current(this->current_a_, this->max_charge_a_, this->max_discharge_a_) : 0;
-  bool newly_blocked = false;
-  if (blocked & sys_ctrl2::CHG_ON) {
-    this->charge_trip_ms_ = now;
-    if (!(this->overcurrent_fets_ & sys_ctrl2::CHG_ON)) {
-      ESP_LOGW(TAG, "Charge current %.3f A exceeds %.3f A, disabling charge", this->current_a_, this->max_charge_a_);
-      newly_blocked = true;
-    }
-  } else if ((this->overcurrent_fets_ & sys_ctrl2::CHG_ON) &&
-             now - this->charge_trip_ms_ >= this->overcurrent_recovery_ms_) {
-    ESP_LOGI(TAG, "Charge overcurrent recovery time elapsed");
-    this->overcurrent_fets_ &= ~sys_ctrl2::CHG_ON;
+  // Readings over the limit while a FET is already held off don't extend the hold, so the retry always happens
+  // `overcurrent_recovery_ms_` after the trip.
+  const uint8_t tripped = blocked & static_cast<uint8_t>(~this->overcurrent_fets_);
+  if (tripped & sys_ctrl2::CHG_ON) {
+    ESP_LOGW(TAG, "Charge current %.3f A exceeds %.3f A, disabling charge for %" PRIu32 " ms", this->current_a_,
+             this->max_charge_a_, this->overcurrent_recovery_ms_);
+    this->schedule_overcurrent_retry_(sys_ctrl2::CHG_ON);
   }
-  if (blocked & sys_ctrl2::DSG_ON) {
-    this->discharge_trip_ms_ = now;
-    if (!(this->overcurrent_fets_ & sys_ctrl2::DSG_ON)) {
-      ESP_LOGW(TAG, "Discharge current %.3f A exceeds %.3f A, disabling discharge", -this->current_a_,
-               this->max_discharge_a_);
-      newly_blocked = true;
-    }
-  } else if ((this->overcurrent_fets_ & sys_ctrl2::DSG_ON) &&
-             now - this->discharge_trip_ms_ >= this->overcurrent_recovery_ms_) {
-    ESP_LOGI(TAG, "Discharge overcurrent recovery time elapsed");
-    this->overcurrent_fets_ &= ~sys_ctrl2::DSG_ON;
+  if (tripped & sys_ctrl2::DSG_ON) {
+    ESP_LOGW(TAG, "Discharge current %.3f A exceeds %.3f A, disabling discharge for %" PRIu32 " ms", -this->current_a_,
+             this->max_discharge_a_, this->overcurrent_recovery_ms_);
+    this->schedule_overcurrent_retry_(sys_ctrl2::DSG_ON);
   }
-  this->overcurrent_fets_ |= blocked;
-  return newly_blocked;
+  this->overcurrent_fets_ |= tripped;
+  return tripped != 0;
+}
+
+void BQ769X0Component::schedule_overcurrent_retry_(uint8_t fet) {
+  const bool charge = fet == sys_ctrl2::CHG_ON;
+  this->set_timeout(charge ? "charge_oc_retry" : "discharge_oc_retry", this->overcurrent_recovery_ms_,
+                    [this, fet, charge]() {
+                      ESP_LOGI(TAG, "Retrying %s after overcurrent", charge ? "charge" : "discharge");
+                      this->overcurrent_fets_ &= static_cast<uint8_t>(~fet);
+                      // A still-excessive current trips the FET off again on the next reading.
+                      this->update_fets_();
+                      this->publish_alarms_();
+                    });
 }
 
 bool BQ769X0Component::update_fets_() {
   const uint8_t controlled = this->controlled_fets_();
-  if (controlled != 0) {
-    this->check_current_limits_();
-  }
   uint8_t sys_ctrl1, sys_ctrl2;
   if (!this->read_register_(reg::SYS_CTRL1, &sys_ctrl1) || !this->read_register_(reg::SYS_CTRL2, &sys_ctrl2)) {
     ESP_LOGW(TAG, "Failed to read FET state");
@@ -399,6 +471,24 @@ void BQ769X0Component::dump_config() {
   if (this->max_charge_a_ > 0.0f || this->max_discharge_a_ > 0.0f) {
     ESP_LOGCONFIG(TAG, "  Overcurrent recovery time: %" PRIu32 " ms", this->overcurrent_recovery_ms_);
   }
+  {
+    const bool upper = this->protect_[0] & 0x80;
+    const uint8_t scd_mv = SCD_THRESHOLDS_MV[upper][this->protect_[0] & 0x07];
+    const uint8_t ocd_mv = OCD_THRESHOLDS_MV[upper][this->protect_[1] & 0x0F];
+    const float to_a = this->shunt_resistance_ > 0.0f ? 0.001f / this->shunt_resistance_ : NAN;
+    ESP_LOGCONFIG(TAG,
+                  "  Hardware protection:\n"
+                  "    OV: %" PRId32 " mV after %u s\n"
+                  "    UV: %" PRId32 " mV after %u s\n"
+                  "    OCD: %u mV (%.2f A) after %u ms\n"
+                  "    SCD: %u mV (%.2f A) after %u us",
+                  ov_trip_mv(this->protect_[3], this->adc_gain_uv_, this->adc_offset_mv_),
+                  OV_DELAYS_S[(this->protect_[2] >> 4) & 0x03],
+                  uv_trip_mv(this->protect_[4], this->adc_gain_uv_, this->adc_offset_mv_),
+                  UV_DELAYS_S[(this->protect_[2] >> 6) & 0x03], ocd_mv, ocd_mv * to_a,
+                  OCD_DELAYS_MS[(this->protect_[1] >> 4) & 0x07], scd_mv, scd_mv * to_a,
+                  SCD_DELAYS_US[(this->protect_[0] >> 3) & 0x03]);
+  }
   if (this->balancing_enabled_) {
     ESP_LOGCONFIG(TAG,
                   "  Balancing: enabled\n"
@@ -481,14 +571,33 @@ bool BQ769X0Component::process_status_() {
   ESP_LOGVV(TAG, "SYS_STAT: 0x%02X", status);
   // CC_READY fires every 250 ms while the coulomb counter runs, anything else is worth reporting.
   if (status & ~sys_stat::CC_READY) {
+    ESP_LOGV(TAG, "SYS_STAT alert: 0x%02X", status);
+  }
+  if (status & (sys_stat::DEVICE_XREADY | sys_stat::OVRD_ALERT)) {
     ESP_LOGW(TAG, "SYS_STAT alert: 0x%02X", status);
   }
   // The device has already turned DSG off. Keep it off until the load is gone rather than switching it back on
   // into a short.
-  if ((status & (sys_stat::SCD | sys_stat::OCD)) && !this->load_fault_) {
-    ESP_LOGW(TAG, "Discharge fault, FETs held off until the load is removed");
+  bool short_circuit = status & sys_stat::SCD;
+  if (status & sys_stat::OCD) {
+    if (this->max_discharge_a_ > 0.0f) {
+      // Hardware OCD enforces maximum_discharge_current, so it gets the same timed retry as the software limit.
+      if (!(this->overcurrent_fets_ & sys_ctrl2::DSG_ON)) {
+        ESP_LOGW(TAG, "Hardware discharge overcurrent, disabling discharge for %" PRIu32 " ms",
+                 this->overcurrent_recovery_ms_);
+        this->overcurrent_fets_ |= sys_ctrl2::DSG_ON;
+        this->schedule_overcurrent_retry_(sys_ctrl2::DSG_ON);
+      }
+    } else {
+      short_circuit = true;
+    }
+  }
+  if (short_circuit && !this->load_fault_) {
+    ESP_LOGW(TAG, "Short circuit, FETs held off until the load is removed");
     this->load_fault_ = true;
   }
+  this->track_voltage_trip_(0, status & sys_stat::OV);
+  this->track_voltage_trip_(1, status & sys_stat::UV);
   // A fresh coulomb counter reading every 250 ms; reading it here keeps overcurrent response fast when the
   // alert pin is used.
   bool ok = true;
@@ -507,6 +616,25 @@ bool BQ769X0Component::process_status_() {
   return ok;
 }
 
+void BQ769X0Component::track_voltage_trip_(uint8_t index, bool tripped) {
+  static const char *const NAMES[2] = {"overvoltage", "undervoltage"};
+  static const char *const FETS[2] = {"charge", "discharge"};
+  const uint32_t now = millis();
+  // While the fault persists the device trips again one delay after each clear; a gap longer than that ends it.
+  const uint32_t delay_s = index == 0 ? OV_DELAYS_S[this->ov_delay_code_] : UV_DELAYS_S[this->uv_delay_code_];
+  const uint32_t timeout_ms = delay_s * 1000 + VOLTAGE_TRIP_MARGIN_MS;
+  if (tripped) {
+    if (!this->voltage_trip_active_[index]) {
+      ESP_LOGW(TAG, "Hardware %s tripped, %s disabled", NAMES[index], FETS[index]);
+      this->voltage_trip_active_[index] = true;
+    }
+    this->voltage_trip_ms_[index] = now;
+  } else if (this->voltage_trip_active_[index] && now - this->voltage_trip_ms_[index] > timeout_ms) {
+    ESP_LOGI(TAG, "Hardware %s cleared", NAMES[index]);
+    this->voltage_trip_active_[index] = false;
+  }
+}
+
 uint8_t BQ769X0Component::active_alarms_() const {
   uint8_t alarms = 0;
   if (this->cells_valid_) {
@@ -522,7 +650,7 @@ uint8_t BQ769X0Component::active_alarms_() const {
     alarms |= alarm::OVER_DISCHARGE_CURRENT;
   }
   if (this->load_fault_) {
-    alarms |= alarm::DISCHARGE_FAULT;
+    alarms |= alarm::SHORT_CIRCUIT;
   }
   return alarms;
 }

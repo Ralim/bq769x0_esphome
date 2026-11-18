@@ -263,12 +263,65 @@ static void test_alarms() {
   // Every alarm at once fits the buffer size the component uses.
   const size_t len = format_alarms(0x1F, text, sizeof(text));
   EXPECT_STREQ(text,
-               "Over Cell Voltage, Under Cell Voltage, Over Charge Current, Over Discharge Current, Discharge Fault");
+               "Over Cell Voltage, Under Cell Voltage, Over Charge Current, Over Discharge Current, Short Circuit");
   EXPECT_EQ(len < sizeof(text) - 1, true);
   // Truncation always leaves a terminated string.
   char small[8];
   EXPECT_EQ(format_alarms(alarm::OVER_CELL_VOLTAGE, small, sizeof(small)), 7);
   EXPECT_STREQ(small, "Over Ce");
+}
+
+static void test_protection() {
+  // Calibration of the demo board: 377 uV/LSB, +47 mV.
+  const uint16_t gain = 377;
+  const int8_t offset = 47;
+  // The device defaults read from the demo board decode to the datasheet's nominal levels.
+  EXPECT_EQ(ov_trip_mv(OV_TRIP_DEFAULT, gain, offset), 4175);
+  EXPECT_EQ(uv_trip_mv(UV_TRIP_DEFAULT, gain, offset), 2502);
+
+  // OV rounds up and UV rounds down to the next ~6 mV step, never tighter than requested.
+  const uint8_t ov = ov_trip_code(3550, gain, offset);
+  EXPECT_EQ(ov_trip_mv(ov, gain, offset) >= 3550, true);
+  EXPECT_EQ(ov_trip_mv(ov - 1, gain, offset) < 3550, true);
+  const uint8_t uv = uv_trip_code(2650, gain, offset);
+  EXPECT_EQ(uv_trip_mv(uv, gain, offset) <= 2650, true);
+  EXPECT_EQ(uv_trip_mv(uv + 1, gain, offset) > 2650, true);
+  // Requests outside the register range clamp to the nearest end.
+  EXPECT_EQ(ov_trip_code(5000, gain, offset), 0xFF);
+  EXPECT_EQ(ov_trip_code(1000, gain, offset), 0x00);
+  EXPECT_EQ(uv_trip_code(1000, gain, offset), 0x00);
+  EXPECT_EQ(uv_trip_code(4000, gain, offset), 0xFF);
+  EXPECT_EQ(ov_trip_adc(0xAC), 0x2AC8);
+  EXPECT_EQ(uv_trip_adc(0x97), 0x1970);
+
+  // OCD/SCD pick the smallest threshold at or above the request.
+  EXPECT_EQ(threshold_code_at_or_above(OCD_THRESHOLDS_MV[0], 16, 0.0f), 0);
+  EXPECT_EQ(threshold_code_at_or_above(OCD_THRESHOLDS_MV[0], 16, 8.0f), 0);
+  EXPECT_EQ(threshold_code_at_or_above(OCD_THRESHOLDS_MV[0], 16, 20.0f), 5);
+  EXPECT_EQ(threshold_code_at_or_above(OCD_THRESHOLDS_MV[0], 16, 50.0f), 15);
+  EXPECT_EQ(threshold_code_at_or_above(SCD_THRESHOLDS_MV[0], 8, 40.0f), 2);
+  EXPECT_EQ(threshold_code_at_or_above(SCD_THRESHOLDS_MV[1], 8, 150.0f), 5);
+  EXPECT_EQ(threshold_code_at_or_above(SCD_THRESHOLDS_MV[1], 8, 500.0f), 7);
+  // The upper range is only used when the lower one can't reach either threshold.
+  EXPECT_EQ(protection_upper_range(50.0f, 100.0f), false);
+  EXPECT_EQ(protection_upper_range(51.0f, 0.0f), true);
+  EXPECT_EQ(protection_upper_range(0.0f, 101.0f), true);
+
+  // Register packing; with every code 0 this is the device reset state.
+  EXPECT_EQ(protect1_value(false, 0, 0), 0x00);
+  EXPECT_EQ(protect1_value(true, 3, 7), 0x9F);
+  EXPECT_EQ(protect1_value(false, 1, 2), 0x0A);
+  EXPECT_EQ(protect2_value(0, 0), 0x00);
+  EXPECT_EQ(protect2_value(7, 15), 0x7F);
+  EXPECT_EQ(protect2_value(2, 5), 0x25);
+  EXPECT_EQ(protect3_value(0, 0), 0x00);
+  EXPECT_EQ(protect3_value(3, 3), 0xF0);
+  EXPECT_EQ(protect3_value(1, 2), 0x60);
+  // Delay tables match the register order in the datasheet.
+  EXPECT_EQ(SCD_DELAYS_US[3], 400);
+  EXPECT_EQ(OCD_DELAYS_MS[7], 1280);
+  EXPECT_EQ(OV_DELAYS_S[3], 8);
+  EXPECT_EQ(UV_DELAYS_S[3], 16);
 }
 
 int main() {
@@ -290,6 +343,7 @@ int main() {
   test_cellbal_register_value();
   test_fet_limits();
   test_alarms();
+  test_protection();
   if (failures != 0) {
     std::printf("%d failure(s)\n", failures);
     return EXIT_FAILURE;

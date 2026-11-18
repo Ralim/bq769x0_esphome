@@ -14,6 +14,8 @@ substitutions:
   # Charge/discharge is turned off while the current exceeds these.
   maximum_charge_current: 10A
   maximum_discharge_current: 20A
+  # Hardware short-circuit protection, must be above the maximum discharge current.
+  short_circuit_current: 40A
   balancing_enabled: "true"
   balancing_minimum_delta: 10mV
   balancing_minimum_voltage: 3450mV
@@ -57,7 +59,11 @@ bq769x0:
   maximum_cell_voltage: ${maximum_cell_voltage}
   maximum_charge_current: ${maximum_charge_current}
   maximum_discharge_current: ${maximum_discharge_current}
-  overcurrent_recovery_time: 30s
+  short_circuit_current: ${short_circuit_current}
+  short_circuit_delay: 70us
+  discharge_overcurrent_delay: 8ms
+  overvoltage_delay: 1s
+  undervoltage_delay: 1s
   balancing:
     enabled: ${balancing_enabled}
     minimum_delta: ${balancing_minimum_delta}

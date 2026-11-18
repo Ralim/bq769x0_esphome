@@ -22,6 +22,8 @@
 namespace esphome::bq769x0 {
 
 static constexpr uint8_t MAX_CELLS = 15;
+// Slack on top of the OV/UV delay before a hardware voltage trip is considered over.
+static constexpr uint32_t VOLTAGE_TRIP_MARGIN_MS = 1000;
 
 class BQ769X0Component : public PollingComponent, public i2c::I2CDevice {
  public:
@@ -45,6 +47,12 @@ class BQ769X0Component : public PollingComponent, public i2c::I2CDevice {
   void set_maximum_charge_current(float amps) { this->max_charge_a_ = amps; }
   void set_maximum_discharge_current(float amps) { this->max_discharge_a_ = amps; }
   void set_overcurrent_recovery_time(uint32_t ms) { this->overcurrent_recovery_ms_ = ms; }
+  void set_short_circuit_current(float amps) { this->short_circuit_a_ = amps; }
+  // Delays are register codes, indexes into the *_DELAYS_* tables.
+  void set_short_circuit_delay_code(uint8_t code) { this->scd_delay_code_ = code; }
+  void set_discharge_overcurrent_delay_code(uint8_t code) { this->ocd_delay_code_ = code; }
+  void set_overvoltage_delay_code(uint8_t code) { this->ov_delay_code_ = code; }
+  void set_undervoltage_delay_code(uint8_t code) { this->uv_delay_code_ = code; }
 
 #ifdef USE_SENSOR
   // `cell` is zero-based.
@@ -72,6 +80,10 @@ class BQ769X0Component : public PollingComponent, public i2c::I2CDevice {
   bool write_register_(uint8_t a_register, uint8_t value);
 
   void wake_device_();
+  // Writes and verifies the hardware OV/UV/OCD/SCD protection from the configured limits.
+  bool configure_protection_();
+  // Logs a hardware OV (index 0) or UV (index 1) trip once per episode instead of on every re-trip.
+  void track_voltage_trip_(uint8_t index, bool tripped);
   // Reads, reports and clears SYS_STAT, latching discharge faults and reading the current when it is fresh.
   bool process_status_();
   // Each returns false if the device could not be read or the reading is not trustworthy.
@@ -85,8 +97,11 @@ class BQ769X0Component : public PollingComponent, public i2c::I2CDevice {
   bool update_balancing_();
   // FET bits (CHG_ON/DSG_ON) that have a voltage or current limit configured.
   uint8_t controlled_fets_() const;
-  // Holds FETs off while the current exceeds its limit; returns true if a FET was newly blocked.
+  // Holds a FET off when the latest current reading exceeds its limit; returns true if a FET was newly tripped.
+  // Only called for fresh coulomb counter readings, so a retry is judged on a reading taken after it.
   bool check_current_limits_();
+  // Clears the overcurrent hold on `fet` and retries it `overcurrent_recovery_ms_` from now.
+  void schedule_overcurrent_retry_(uint8_t fet);
   // Switches the controlled CHG/DSG FETs according to the cell voltage and current limits, and publishes the
   // resulting FET state.
   bool update_fets_();
@@ -114,10 +129,19 @@ class BQ769X0Component : public PollingComponent, public i2c::I2CDevice {
   float max_charge_a_{0.0f};
   float max_discharge_a_{0.0f};
   uint32_t overcurrent_recovery_ms_{0};
-  // FET bits held off by an overcurrent, each until `overcurrent_recovery_ms_` after its last trip.
+  // FET bits held off by an overcurrent, each until its retry timeout fires.
   uint8_t overcurrent_fets_{0};
-  uint32_t charge_trip_ms_{0};
-  uint32_t discharge_trip_ms_{0};
+
+  float short_circuit_a_{0.0f};
+  uint8_t scd_delay_code_{0};
+  uint8_t ocd_delay_code_{0};
+  uint8_t ov_delay_code_{0};
+  uint8_t uv_delay_code_{0};
+  // PROTECT1, PROTECT2, PROTECT3, OV_TRIP and UV_TRIP as written to the device.
+  uint8_t protect_[5]{};
+  // Hardware OV/UV trip episodes, for logging.
+  bool voltage_trip_active_[2]{};
+  uint32_t voltage_trip_ms_[2]{};
   // Latest coulomb counter reading in A, positive when charging.
   float current_a_{0.0f};
   bool current_valid_{false};

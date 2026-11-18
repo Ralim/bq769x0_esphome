@@ -86,7 +86,7 @@ static constexpr uint8_t DSG_ON = 1 << 1;
 static constexpr uint8_t CHG_ON = 1 << 0;
 }  // namespace sys_ctrl2
 
-// The datasheet requires CC_CFG to be programmed to this value after every boot.
+// CC_CFG must be programmed to this value after every boot.
 static constexpr uint8_t CC_CFG_VALUE = 0x19;
 
 // CRC-8, polynomial x^8 + x^2 + x + 1 (0x07), initial value 0, as used by the CRC-enabled part variants.
@@ -131,6 +131,87 @@ constexpr uint16_t adc_raw14(uint8_t hi, uint8_t lo) { return static_cast<uint16
 // Cell voltage in mV from a 14-bit ADC reading and the factory gain/offset.
 constexpr int32_t cell_voltage_mv(uint16_t raw, uint16_t gain_uv, int8_t offset_mv) {
   return (static_cast<int32_t>(raw) * gain_uv) / 1000 + offset_mv;
+}
+
+// Hardware protection. OCD/SCD thresholds are in mV across the sense resistor, indexed by the register code, for
+// PROTECT1[RSNS] = 0 and 1. The RSNS bit selects the range for both at once.
+static constexpr uint8_t OCD_THRESHOLDS_MV[2][16] = {
+    {8, 11, 14, 17, 19, 22, 25, 28, 31, 33, 36, 39, 42, 44, 47, 50},
+    {17, 22, 28, 33, 39, 44, 50, 56, 61, 67, 72, 78, 83, 89, 94, 100},
+};
+static constexpr uint8_t SCD_THRESHOLDS_MV[2][8] = {
+    {22, 33, 44, 56, 67, 78, 89, 100},
+    {44, 67, 89, 111, 133, 155, 178, 200},
+};
+// Delays per register code.
+static constexpr uint16_t SCD_DELAYS_US[4] = {70, 100, 200, 400};
+static constexpr uint16_t OCD_DELAYS_MS[8] = {8, 20, 40, 80, 160, 320, 640, 1280};
+static constexpr uint8_t OV_DELAYS_S[4] = {1, 2, 4, 8};
+static constexpr uint8_t UV_DELAYS_S[4] = {1, 4, 8, 16};
+
+// Whether the upper OCD/SCD range (RSNS = 1) is needed to reach the requested thresholds.
+constexpr bool protection_upper_range(float ocd_mv, float scd_mv) {
+  return ocd_mv > OCD_THRESHOLDS_MV[0][15] || scd_mv > SCD_THRESHOLDS_MV[0][7];
+}
+
+// Code of the smallest threshold at or above `mv`, so the hardware never trips below the requested value. Values
+// above the table use the largest threshold.
+constexpr uint8_t threshold_code_at_or_above(const uint8_t *thresholds_mv, uint8_t count, float mv) {
+  for (uint8_t i = 0; i < count; i++) {
+    if (thresholds_mv[i] + 0.001f >= mv) {
+      return i;
+    }
+  }
+  return static_cast<uint8_t>(count - 1);
+}
+
+constexpr uint8_t protect1_value(bool upper_range, uint8_t scd_delay_code, uint8_t scd_code) {
+  return static_cast<uint8_t>((upper_range ? 0x80 : 0) | ((scd_delay_code & 0x03) << 3) | (scd_code & 0x07));
+}
+
+constexpr uint8_t protect2_value(uint8_t ocd_delay_code, uint8_t ocd_code) {
+  return static_cast<uint8_t>(((ocd_delay_code & 0x07) << 4) | (ocd_code & 0x0F));
+}
+
+// PROTECT3 bits 3:0 are reserved and must stay 0.
+constexpr uint8_t protect3_value(uint8_t uv_delay_code, uint8_t ov_delay_code) {
+  return static_cast<uint8_t>(((uv_delay_code & 0x03) << 6) | ((ov_delay_code & 0x03) << 4));
+}
+
+// Device defaults for the trip registers, kept when no limit is configured.
+static constexpr uint8_t OV_TRIP_DEFAULT = 0xAC;
+static constexpr uint8_t UV_TRIP_DEFAULT = 0x97;
+
+// OV/UV trip registers hold the middle 8 bits of a 14-bit ADC value: OV is 10-OV_TRIP-1000 and UV is
+// 01-UV_TRIP-0000.
+constexpr uint16_t ov_trip_adc(uint8_t code) { return static_cast<uint16_t>(0x2000 | (code << 4) | 0x8); }
+constexpr uint16_t uv_trip_adc(uint8_t code) { return static_cast<uint16_t>(0x1000 | (code << 4)); }
+
+constexpr int32_t ov_trip_mv(uint8_t code, uint16_t gain_uv, int8_t offset_mv) {
+  return cell_voltage_mv(ov_trip_adc(code), gain_uv, offset_mv);
+}
+constexpr int32_t uv_trip_mv(uint8_t code, uint16_t gain_uv, int8_t offset_mv) {
+  return cell_voltage_mv(uv_trip_adc(code), gain_uv, offset_mv);
+}
+
+// Smallest OV_TRIP whose threshold is at or above `mv`, clamped to the register range.
+constexpr uint8_t ov_trip_code(int32_t mv, uint16_t gain_uv, int8_t offset_mv) {
+  for (int code = 0; code < 256; code++) {
+    if (ov_trip_mv(static_cast<uint8_t>(code), gain_uv, offset_mv) >= mv) {
+      return static_cast<uint8_t>(code);
+    }
+  }
+  return 0xFF;
+}
+
+// Largest UV_TRIP whose threshold is at or below `mv`, clamped to the register range.
+constexpr uint8_t uv_trip_code(int32_t mv, uint16_t gain_uv, int8_t offset_mv) {
+  for (int code = 255; code >= 0; code--) {
+    if (uv_trip_mv(static_cast<uint8_t>(code), gain_uv, offset_mv) <= mv) {
+      return static_cast<uint8_t>(code);
+    }
+  }
+  return 0x00;
 }
 
 // Pack voltage in mV from the 16-bit BAT reading: 4 x GAIN x ADC + (#cells x OFFSET).
@@ -308,8 +389,8 @@ static constexpr uint8_t OVER_CELL_VOLTAGE = 1 << 0;
 static constexpr uint8_t UNDER_CELL_VOLTAGE = 1 << 1;
 static constexpr uint8_t OVER_CHARGE_CURRENT = 1 << 2;
 static constexpr uint8_t OVER_DISCHARGE_CURRENT = 1 << 3;
-// Device short-circuit or overcurrent protection tripped, held until the load is removed.
-static constexpr uint8_t DISCHARGE_FAULT = 1 << 4;
+// Device short-circuit protection tripped, held until the load is removed.
+static constexpr uint8_t SHORT_CIRCUIT = 1 << 4;
 static constexpr uint8_t COUNT = 5;
 }  // namespace alarm
 
@@ -324,7 +405,7 @@ constexpr const char *alarm_name(uint8_t index) {
     case 3:
       return "Over Discharge Current";
     case 4:
-      return "Discharge Fault";
+      return "Short Circuit";
     default:
       return "Unknown";
   }

@@ -1,0 +1,81 @@
+# Demo board configuration, also used by CI to compile the component.
+# Build with: esphome compile bq769x0_demo.yaml
+# Override a parameter with e.g.: esphome -s cell_count 5 run bq769x0_demo.yaml
+substitutions:
+  # Number of cells connected. The component warns and publishes NaN if it detects a different number.
+  # Per-cell sensors below must not exceed this count; add or remove them to match.
+  cell_count: "4"
+  address: "0x18"
+  crc: "false"
+  shunt_resistance: "0.5mOhm"
+  balancing_enabled: "true"
+  balancing_minimum_delta: 10mV
+  balancing_minimum_voltage: 3450mV
+  log_level: DEBUG
+
+esphome:
+  name: bq769x0-demo
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: ${log_level}
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components:
+      - bq769x0
+
+i2c:
+  sda: GPIO6
+  scl: GPIO5
+
+bq769x0:
+  id: bms
+  model: BQ76920
+  cell_count: ${cell_count}
+  crc: ${crc}
+  address: ${address}
+  shunt_resistance: ${shunt_resistance}
+  update_interval: 5s
+  alert_pin:
+    number: GPIO10
+    inverted: false
+  wakeup_pin: GPIO4
+  balancing:
+    enabled: ${balancing_enabled}
+    minimum_delta: ${balancing_minimum_delta}
+    minimum_voltage: ${balancing_minimum_voltage}
+
+sensor:
+  - platform: bq769x0
+    bq769x0_id: bms
+    pack_voltage:
+      name: Pack Voltage
+    current:
+      name: Pack Current
+    cell_1:
+      name: Cell 1 Voltage
+    cell_2:
+      name: Cell 2 Voltage
+    cell_3:
+      name: Cell 3 Voltage
+    cell_4:
+      name: Cell 4 Voltage
+
+binary_sensor:
+  - platform: bq769x0
+    bq769x0_id: bms
+    balancing_cell_1:
+      name: Cell 1 Balancing
+    balancing_cell_2:
+      name: Cell 2 Balancing
+    balancing_cell_3:
+      name: Cell 3 Balancing
+    balancing_cell_4:
+      name: Cell 4 Balancing

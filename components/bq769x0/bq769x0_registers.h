@@ -198,20 +198,40 @@ constexpr uint16_t odd_cell_inputs(uint16_t populated) {
   return mask;
 }
 
+// Lowest and highest voltage among the populated inputs. Both are 0 when nothing is populated.
+constexpr int32_t lowest_cell_mv(const int32_t *input_mv, uint16_t populated, uint8_t inputs) {
+  int32_t lowest = INT32_MAX;
+  for (uint8_t i = 0; i < inputs; i++) {
+    if ((populated & (1u << i)) && input_mv[i] < lowest) {
+      lowest = input_mv[i];
+    }
+  }
+  return lowest == INT32_MAX ? 0 : lowest;
+}
+
+constexpr int32_t highest_cell_mv(const int32_t *input_mv, uint16_t populated, uint8_t inputs) {
+  int32_t highest = INT32_MIN;
+  for (uint8_t i = 0; i < inputs; i++) {
+    if ((populated & (1u << i)) && input_mv[i] > highest) {
+      highest = input_mv[i];
+    }
+  }
+  return highest == INT32_MIN ? 0 : highest;
+}
+
+// Maximum difference between any two populated cells.
+constexpr int32_t max_cell_delta_mv(const int32_t *input_mv, uint16_t populated, uint8_t inputs) {
+  return highest_cell_mv(input_mv, populated, inputs) - lowest_cell_mv(input_mv, populated, inputs);
+}
+
 // Odd-even balancing: the cells (as a bitmask of inputs, bit 0 = VC1) that need bleeding down. A cell needs
 // balancing when it is above both `min_voltage_mv` and the lowest cell by more than `min_delta_mv`.
 // Nothing is balanced when the spread is implausibly large (at least the lowest cell voltage), which
 // indicates a bad reading rather than an imbalance.
 constexpr uint16_t cells_needing_balance(const int32_t *input_mv, uint16_t populated, uint8_t inputs,
                                          int32_t min_delta_mv, int32_t min_voltage_mv) {
-  int32_t lowest = INT32_MAX;
-  int32_t highest = INT32_MIN;
-  for (uint8_t i = 0; i < inputs; i++) {
-    if (populated & (1u << i)) {
-      lowest = input_mv[i] < lowest ? input_mv[i] : lowest;
-      highest = input_mv[i] > highest ? input_mv[i] : highest;
-    }
-  }
+  const int32_t lowest = lowest_cell_mv(input_mv, populated, inputs);
+  const int32_t highest = highest_cell_mv(input_mv, populated, inputs);
   if (populated == 0 || highest <= min_voltage_mv) {
     return 0;
   }
@@ -249,6 +269,121 @@ constexpr uint16_t balancing_inputs(const uint8_t *cellbal, uint8_t registers) {
     mask |= static_cast<uint16_t>((cellbal[i] & 0x1F) << (i * 5));
   }
   return mask;
+}
+
+// FET bits (CHG_ON/DSG_ON) the cell voltage limits allow to be on: DSG while the lowest cell is at or above
+// `min_cell_mv` and CHG while the highest cell is at or below `max_cell_mv`. A limit of 0 never blocks.
+constexpr uint8_t fets_allowed_by_voltage(int32_t lowest_mv, int32_t highest_mv, int32_t min_cell_mv,
+                                          int32_t max_cell_mv) {
+  uint8_t allowed = 0;
+  if (min_cell_mv <= 0 || lowest_mv >= min_cell_mv) {
+    allowed |= sys_ctrl2::DSG_ON;
+  }
+  if (max_cell_mv <= 0 || highest_mv <= max_cell_mv) {
+    allowed |= sys_ctrl2::CHG_ON;
+  }
+  return allowed;
+}
+
+// FET bits to turn off because the current exceeds a limit. Positive current is charging. A limit of 0 never
+// blocks.
+constexpr uint8_t fets_blocked_by_current(float current_a, float max_charge_a, float max_discharge_a) {
+  uint8_t blocked = 0;
+  if (max_charge_a > 0.0f && current_a > max_charge_a) {
+    blocked |= sys_ctrl2::CHG_ON;
+  }
+  if (max_discharge_a > 0.0f && -current_a > max_discharge_a) {
+    blocked |= sys_ctrl2::DSG_ON;
+  }
+  return blocked;
+}
+
+// SYS_CTRL2 with the `controlled` FET bits replaced by those in `on`; all other bits are preserved.
+constexpr uint8_t apply_fets(uint8_t sys_ctrl2, uint8_t controlled, uint8_t on) {
+  return static_cast<uint8_t>((sys_ctrl2 & ~controlled) | (on & controlled));
+}
+
+namespace alarm {
+static constexpr uint8_t OVER_CELL_VOLTAGE = 1 << 0;
+static constexpr uint8_t UNDER_CELL_VOLTAGE = 1 << 1;
+static constexpr uint8_t OVER_CHARGE_CURRENT = 1 << 2;
+static constexpr uint8_t OVER_DISCHARGE_CURRENT = 1 << 3;
+// Device short-circuit or overcurrent protection tripped, held until the load is removed.
+static constexpr uint8_t DISCHARGE_FAULT = 1 << 4;
+static constexpr uint8_t COUNT = 5;
+}  // namespace alarm
+
+constexpr const char *alarm_name(uint8_t index) {
+  switch (index) {
+    case 0:
+      return "Over Cell Voltage";
+    case 1:
+      return "Under Cell Voltage";
+    case 2:
+      return "Over Charge Current";
+    case 3:
+      return "Over Discharge Current";
+    case 4:
+      return "Discharge Fault";
+    default:
+      return "Unknown";
+  }
+}
+
+constexpr size_t alarm_text_length(const char *text) {
+  size_t len = 0;
+  while (text[len] != '\0') {
+    len++;
+  }
+  return len;
+}
+
+// Buffer size that fits every alarm at once, including separators and the terminator.
+constexpr size_t alarms_text_size() {
+  size_t size = 1;
+  for (uint8_t i = 0; i < alarm::COUNT; i++) {
+    size += alarm_text_length(alarm_name(i)) + 2;
+  }
+  return size;
+}
+
+// Voltage alarms for the given cell extremes. A limit of 0 never alarms.
+constexpr uint8_t voltage_alarms(int32_t lowest_mv, int32_t highest_mv, int32_t min_cell_mv, int32_t max_cell_mv) {
+  uint8_t alarms = 0;
+  if (max_cell_mv > 0 && highest_mv > max_cell_mv) {
+    alarms |= alarm::OVER_CELL_VOLTAGE;
+  }
+  if (min_cell_mv > 0 && lowest_mv < min_cell_mv) {
+    alarms |= alarm::UNDER_CELL_VOLTAGE;
+  }
+  return alarms;
+}
+
+// Text for an alarm bitmask: the active alarm names separated by ", ", or "OK" when there are none.
+// Returns the length written, truncating to fit `size`.
+inline size_t format_alarms(uint8_t alarms, char *out, size_t size) {
+  if (size == 0) {
+    return 0;
+  }
+  size_t pos = 0;
+  auto append = [&](const char *text) {
+    for (; *text != '\0' && pos + 1 < size; text++) {
+      out[pos++] = *text;
+    }
+  };
+  if (alarms == 0) {
+    append("OK");
+  }
+  for (uint8_t i = 0; i < alarm::COUNT; i++) {
+    if (alarms & (1u << i)) {
+      if (pos != 0) {
+        append(", ");
+      }
+      append(alarm_name(i));
+    }
+  }
+  out[pos] = '\0';
+  return pos;
 }
 
 }  // namespace esphome::bq769x0

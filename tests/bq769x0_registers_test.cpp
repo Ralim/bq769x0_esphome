@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 
 #include "bq769x0/bq769x0_registers.h"
@@ -17,6 +18,14 @@ static int failures = 0;
     const long long e_ = static_cast<long long>(expected); \
     if (a_ != e_) { \
       std::printf("%s:%d: %s == %lld, expected %lld\n", __FILE__, __LINE__, #actual, a_, e_); \
+      failures++; \
+    } \
+  } while (0)
+
+#define EXPECT_STREQ(actual, expected) \
+  do { \
+    if (std::strcmp((actual), (expected)) != 0) { \
+      std::printf("%s:%d: %s == \"%s\", expected \"%s\"\n", __FILE__, __LINE__, #actual, (actual), (expected)); \
       failures++; \
     } \
   } while (0)
@@ -125,6 +134,20 @@ static void test_odd_cell_inputs() {
   EXPECT_EQ(odd_cell_inputs(0), 0);
 }
 
+static void test_cell_extremes() {
+  // Unpopulated VC4 (40 mV) is ignored.
+  const int32_t four_s[] = {3500, 3530, 3510, 40, 3520};
+  EXPECT_EQ(lowest_cell_mv(four_s, 0b10111, 5), 3500);
+  EXPECT_EQ(highest_cell_mv(four_s, 0b10111, 5), 3530);
+  EXPECT_EQ(max_cell_delta_mv(four_s, 0b10111, 5), 30);
+  // Including it would make it the lowest.
+  EXPECT_EQ(max_cell_delta_mv(four_s, 0b11111, 5), 3490);
+  EXPECT_EQ(max_cell_delta_mv(four_s, 0b00001, 5), 0);
+  EXPECT_EQ(lowest_cell_mv(four_s, 0, 5), 0);
+  EXPECT_EQ(highest_cell_mv(four_s, 0, 5), 0);
+  EXPECT_EQ(max_cell_delta_mv(four_s, 0, 5), 0);
+}
+
 static void test_cells_needing_balance() {
   const uint16_t all = 0b11111;
   // Spread 30 mV, cells above 3450 and above lowest + 10 mV need balancing.
@@ -186,6 +209,68 @@ static void test_cellbal_register_value() {
   EXPECT_EQ(balancing_inputs(regs, 3), mask);
 }
 
+static void test_fet_limits() {
+  constexpr uint8_t CHG = sys_ctrl2::CHG_ON;
+  constexpr uint8_t DSG = sys_ctrl2::DSG_ON;
+  constexpr uint8_t BOTH = CHG | DSG;
+  constexpr uint8_t CC = sys_ctrl2::CC_EN;
+
+  // Voltage limits are inclusive; only exceeding them turns a FET off.
+  EXPECT_EQ(fets_allowed_by_voltage(3300, 3400, 2650, 3550), BOTH);
+  EXPECT_EQ(fets_allowed_by_voltage(2650, 3550, 2650, 3550), BOTH);
+  EXPECT_EQ(fets_allowed_by_voltage(2649, 3400, 2650, 3550), CHG);
+  EXPECT_EQ(fets_allowed_by_voltage(3300, 3551, 2650, 3550), DSG);
+  EXPECT_EQ(fets_allowed_by_voltage(2000, 3600, 2650, 3550), 0);
+  // A limit of 0 never blocks.
+  EXPECT_EQ(fets_allowed_by_voltage(2000, 3600, 0, 0), BOTH);
+
+  // Current limits: positive is charging, exactly at the limit is allowed.
+  EXPECT_EQ(fets_blocked_by_current(0.0f, 10.0f, 20.0f), 0);
+  EXPECT_EQ(fets_blocked_by_current(10.0f, 10.0f, 20.0f), 0);
+  EXPECT_EQ(fets_blocked_by_current(10.5f, 10.0f, 20.0f), CHG);
+  EXPECT_EQ(fets_blocked_by_current(-20.0f, 10.0f, 20.0f), 0);
+  EXPECT_EQ(fets_blocked_by_current(-20.5f, 10.0f, 20.0f), DSG);
+  // A charge above the discharge limit only blocks charging, and vice versa.
+  EXPECT_EQ(fets_blocked_by_current(25.0f, 30.0f, 20.0f), 0);
+  EXPECT_EQ(fets_blocked_by_current(-15.0f, 10.0f, 20.0f), 0);
+  EXPECT_EQ(fets_blocked_by_current(1000.0f, 0.0f, 0.0f), 0);
+  EXPECT_EQ(fets_blocked_by_current(-1000.0f, 0.0f, 0.0f), 0);
+
+  // Only controlled FET bits change; everything else is preserved.
+  EXPECT_EQ(apply_fets(CC, BOTH, BOTH), CC | BOTH);
+  EXPECT_EQ(apply_fets(CC | BOTH, BOTH, 0), CC);
+  EXPECT_EQ(apply_fets(CC | CHG, DSG, DSG), CC | BOTH);
+  EXPECT_EQ(apply_fets(CHG, DSG, 0), CHG);
+  EXPECT_EQ(apply_fets(BOTH, 0, 0), BOTH);
+}
+
+static void test_alarms() {
+  EXPECT_EQ(voltage_alarms(3300, 3400, 2650, 3550), 0);
+  // Limits are inclusive, matching the FET control.
+  EXPECT_EQ(voltage_alarms(2650, 3550, 2650, 3550), 0);
+  EXPECT_EQ(voltage_alarms(3300, 3551, 2650, 3550), alarm::OVER_CELL_VOLTAGE);
+  EXPECT_EQ(voltage_alarms(2649, 3400, 2650, 3550), alarm::UNDER_CELL_VOLTAGE);
+  EXPECT_EQ(voltage_alarms(2000, 3600, 2650, 3550), alarm::OVER_CELL_VOLTAGE | alarm::UNDER_CELL_VOLTAGE);
+  EXPECT_EQ(voltage_alarms(2000, 3600, 0, 0), 0);
+
+  char text[alarms_text_size()];
+  EXPECT_EQ(format_alarms(0, text, sizeof(text)), 2);
+  EXPECT_STREQ(text, "OK");
+  format_alarms(alarm::UNDER_CELL_VOLTAGE, text, sizeof(text));
+  EXPECT_STREQ(text, "Under Cell Voltage");
+  format_alarms(alarm::OVER_CELL_VOLTAGE | alarm::OVER_DISCHARGE_CURRENT, text, sizeof(text));
+  EXPECT_STREQ(text, "Over Cell Voltage, Over Discharge Current");
+  // Every alarm at once fits the buffer size the component uses.
+  const size_t len = format_alarms(0x1F, text, sizeof(text));
+  EXPECT_STREQ(text,
+               "Over Cell Voltage, Under Cell Voltage, Over Charge Current, Over Discharge Current, Discharge Fault");
+  EXPECT_EQ(len < sizeof(text) - 1, true);
+  // Truncation always leaves a terminated string.
+  char small[8];
+  EXPECT_EQ(format_alarms(alarm::OVER_CELL_VOLTAGE, small, sizeof(small)), 7);
+  EXPECT_STREQ(small, "Over Ce");
+}
+
 int main() {
   test_crc8();
   test_write_crc();
@@ -199,9 +284,12 @@ int main() {
   test_cell_detection();
   test_balancing_inputs();
   test_odd_cell_inputs();
+  test_cell_extremes();
   test_cells_needing_balance();
   test_balance_phase();
   test_cellbal_register_value();
+  test_fet_limits();
+  test_alarms();
   if (failures != 0) {
     std::printf("%d failure(s)\n", failures);
     return EXIT_FAILURE;

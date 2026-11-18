@@ -9,6 +9,7 @@ from esphome.const import (
     DEVICE_CLASS_VOLTAGE,
     STATE_CLASS_MEASUREMENT,
     UNIT_AMPERE,
+    UNIT_MILLIVOLT,
     UNIT_VOLT,
 )
 
@@ -23,6 +24,7 @@ from . import (
 DEPENDENCIES = ["bq769x0"]
 
 CONF_PACK_VOLTAGE = "pack_voltage"
+CONF_MAX_CELL_DELTA = "max_cell_delta"
 CELL_PREFIX = "cell_"
 
 _VOLTAGE_SCHEMA = sensor.sensor_schema(
@@ -45,6 +47,13 @@ CONFIG_SCHEMA = cv.Schema(
             unit_of_measurement=UNIT_AMPERE,
             accuracy_decimals=3,
             device_class=DEVICE_CLASS_CURRENT,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ),
+        # Difference between the highest and lowest cell.
+        cv.Optional(CONF_MAX_CELL_DELTA): sensor.sensor_schema(
+            unit_of_measurement=UNIT_MILLIVOLT,
+            accuracy_decimals=0,
+            device_class=DEVICE_CLASS_VOLTAGE,
             state_class=STATE_CLASS_MEASUREMENT,
         ),
         **{
@@ -78,6 +87,8 @@ async def to_code(config):
         cg.add(hub.set_pack_voltage_sensor(await sensor.new_sensor(pack_config)))
     if current_config := config.get(CONF_CURRENT):
         cg.add(hub.set_current_sensor(await sensor.new_sensor(current_config)))
+    if delta_config := config.get(CONF_MAX_CELL_DELTA):
+        cg.add(hub.set_max_cell_delta_sensor(await sensor.new_sensor(delta_config)))
     for cell in range(1, MAX_CELLS + 1):
         if cell_config := config.get(cell_key(CELL_PREFIX, cell)):
             sens = await sensor.new_sensor(cell_config)

@@ -21,6 +21,11 @@ CONF_CRC = "crc"
 CONF_ENABLED = "enabled"
 CONF_MINIMUM_DELTA = "minimum_delta"
 CONF_MINIMUM_VOLTAGE = "minimum_voltage"
+CONF_MINIMUM_CELL_VOLTAGE = "minimum_cell_voltage"
+CONF_MAXIMUM_CELL_VOLTAGE = "maximum_cell_voltage"
+CONF_MAXIMUM_CHARGE_CURRENT = "maximum_charge_current"
+CONF_MAXIMUM_DISCHARGE_CURRENT = "maximum_discharge_current"
+CONF_OVERCURRENT_RECOVERY_TIME = "overcurrent_recovery_time"
 
 MAX_CELLS = 15
 
@@ -53,7 +58,28 @@ def _validate_cell_count(config):
     return config
 
 
+def _validate_cell_voltage_limits(config):
+    low = config.get(CONF_MINIMUM_CELL_VOLTAGE)
+    high = config.get(CONF_MAXIMUM_CELL_VOLTAGE)
+    if low is not None and high is not None and low >= high:
+        raise cv.Invalid(
+            f"{CONF_MINIMUM_CELL_VOLTAGE} must be below {CONF_MAXIMUM_CELL_VOLTAGE}",
+            path=[CONF_MINIMUM_CELL_VOLTAGE],
+        )
+    return config
+
+
+def _validate_current_limits(config):
+    for key in (CONF_MAXIMUM_CHARGE_CURRENT, CONF_MAXIMUM_DISCHARGE_CURRENT):
+        if key in config and CONF_SHUNT_RESISTANCE not in config:
+            raise cv.Invalid(
+                f"{CONF_SHUNT_RESISTANCE} is required to limit current", path=[key]
+            )
+    return config
+
+
 _POSITIVE_VOLTAGE = cv.All(cv.voltage, cv.Range(min=0.0, min_included=False))
+_POSITIVE_CURRENT = cv.All(cv.current, cv.Range(min=0.0, min_included=False))
 
 # Odd-even balancing: every update, the cells that are above `minimum_voltage`
 # and more than `minimum_delta` above the lowest cell are bled down, alternating
@@ -84,11 +110,24 @@ CONFIG_SCHEMA = cv.All(
             # Pulses TS1 high at boot to bring the device out of SHIP mode.
             cv.Optional(CONF_WAKEUP_PIN): pins.gpio_output_pin_schema,
             cv.Optional(CONF_BALANCING): BALANCING_SCHEMA,
+            # Discharge FET is turned off while any cell is below this.
+            cv.Optional(CONF_MINIMUM_CELL_VOLTAGE): _POSITIVE_VOLTAGE,
+            # Charge FET is turned off while any cell is above this.
+            cv.Optional(CONF_MAXIMUM_CELL_VOLTAGE): _POSITIVE_VOLTAGE,
+            # Charge/discharge FET is turned off while the current exceeds this.
+            cv.Optional(CONF_MAXIMUM_CHARGE_CURRENT): _POSITIVE_CURRENT,
+            cv.Optional(CONF_MAXIMUM_DISCHARGE_CURRENT): _POSITIVE_CURRENT,
+            # How long a FET stays off after the last overcurrent reading.
+            cv.Optional(
+                CONF_OVERCURRENT_RECOVERY_TIME, default="30s"
+            ): cv.positive_time_period_milliseconds,
         }
     )
     .extend(cv.polling_component_schema("5s"))
     .extend(i2c.i2c_device_schema(0x08)),
     _validate_cell_count,
+    _validate_cell_voltage_limits,
+    _validate_current_limits,
 )
 
 
@@ -112,6 +151,17 @@ async def to_code(config):
         cg.add(var.set_balancing_enabled(balancing[CONF_ENABLED]))
         cg.add(var.set_balancing_minimum_delta(balancing[CONF_MINIMUM_DELTA]))
         cg.add(var.set_balancing_minimum_voltage(balancing[CONF_MINIMUM_VOLTAGE]))
+    if CONF_MINIMUM_CELL_VOLTAGE in config:
+        cg.add(var.set_minimum_cell_voltage(config[CONF_MINIMUM_CELL_VOLTAGE]))
+    if CONF_MAXIMUM_CELL_VOLTAGE in config:
+        cg.add(var.set_maximum_cell_voltage(config[CONF_MAXIMUM_CELL_VOLTAGE]))
+    if CONF_MAXIMUM_CHARGE_CURRENT in config:
+        cg.add(var.set_maximum_charge_current(config[CONF_MAXIMUM_CHARGE_CURRENT]))
+    if CONF_MAXIMUM_DISCHARGE_CURRENT in config:
+        cg.add(
+            var.set_maximum_discharge_current(config[CONF_MAXIMUM_DISCHARGE_CURRENT])
+        )
+    cg.add(var.set_overcurrent_recovery_time(config[CONF_OVERCURRENT_RECOVERY_TIME]))
 
 
 def cell_key(prefix, cell):

@@ -7,7 +7,8 @@ substitutions:
   cell_count: "4"
   address: "0x18"
   crc: "false"
-  shunt_resistance: "1mOhm"
+  # R204 on the WiFi-BMS board.
+  shunt_resistance: "5mOhm"
   # Discharge is turned off below the minimum and charge above the maximum (LiFePO4 values).
   minimum_cell_voltage: 2650mV
   maximum_cell_voltage: 3550mV
